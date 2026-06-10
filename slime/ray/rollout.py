@@ -755,6 +755,9 @@ class RolloutManager:
         if any(_get_response_correct(sample) is not None for sample in samples):
             train_data["response_correct"] = [_get_response_correct(sample) for sample in samples]
 
+        if any(sample.group_index is not None for sample in samples):
+            train_data["sample_group_index"] = [sample.group_index for sample in samples]
+
         # For rollout buffer
         if samples[0].metadata and "round_number" in samples[0].metadata:
             train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
@@ -823,6 +826,7 @@ class RolloutManager:
                 "rollout_log_probs",
                 "rollout_routed_experts",
                 "response_correct",
+                "sample_group_index",
                 "prompt",
                 "teacher_log_probs",
             ]:
@@ -1402,6 +1406,7 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
 
 def _get_response_correct(sample: Sample) -> bool | None:
     value = sample.metadata.get("response_correct") if isinstance(sample.metadata, dict) else None

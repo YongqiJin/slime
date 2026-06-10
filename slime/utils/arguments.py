@@ -1137,6 +1137,39 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Use 1.0 for 1:1, 0.0 for incorrect-only, and inf for correct-only."
                 ),
             )
+            parser.add_argument(
+                "--use-opd-margin-shift",
+                action="store_true",
+                default=False,
+                help="Enable OPD correctness margin shift after OPD KL advantage construction.",
+            )
+            parser.add_argument(
+                "--opd-margin-scope",
+                type=str,
+                choices=["local", "global", "group"],
+                default="local",
+                help="Scope for OPD correctness margin shift.",
+            )
+            parser.add_argument(
+                "--opd-margin-mode",
+                type=str,
+                choices=["mean", "minmax"],
+                default="mean",
+                help="Statistic used to compute OPD correctness margin shift.",
+            )
+            parser.add_argument(
+                "--opd-margin-delta",
+                type=float,
+                default=0.0,
+                help="Required gap where correct_stat - incorrect_stat >= delta.",
+            )
+            parser.add_argument(
+                "--opd-margin-direction",
+                type=str,
+                choices=["correct_up", "incorrect_down", "both"],
+                default="correct_up",
+                help="How to apply the OPD correctness margin shift.",
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1775,6 +1808,9 @@ def _validate_opd_args(args) -> None:
     balance_ratio = getattr(args, "opd_correctness_balance_ratio", 1.0)
     if math.isnan(balance_ratio) or balance_ratio < 0:
         raise ValueError("--opd-correctness-balance-ratio must be non-negative and not NaN.")
+    margin_delta = getattr(args, "opd_margin_delta", 0.0)
+    if not math.isfinite(margin_delta) or margin_delta < 0:
+        raise ValueError("--opd-margin-delta must be finite and non-negative.")
 
     if args.use_opd:
         if args.opd_type is None:
