@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from slime.rollout.on_policy_distillation import OPD_TEACHER_LOGPROB_FAILURE_SENTINEL
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
@@ -557,13 +558,28 @@ def apply_opd_kl_to_advantages(
     teacher_log_probs = rollout_data.get("teacher_log_probs")
     if teacher_log_probs is None:
         raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
+    if len(teacher_log_probs) != len(advantages) or len(student_log_probs) != len(advantages):
+        raise ValueError(
+            "OPD teacher_log_probs, student_log_probs, and advantages must have the same number of samples."
+        )
 
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
 
     reverse_kls = []
     for i, adv in enumerate(advantages):
-        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+        if teacher_log_probs[i].shape != student_log_probs[i].shape or adv.shape != student_log_probs[i].shape:
+            raise ValueError(
+                "OPD teacher_log_probs, student_log_probs, and advantages must have matching tensor shapes "
+                f"for sample {i}: teacher={tuple(teacher_log_probs[i].shape)} "
+                f"student={tuple(student_log_probs[i].shape)} advantage={tuple(adv.shape)}"
+            )
+        valid_teacher_logprob_mask = teacher_log_probs[i] != OPD_TEACHER_LOGPROB_FAILURE_SENTINEL
+        reverse_kl = torch.where(
+            valid_teacher_logprob_mask,
+            student_log_probs[i] - teacher_log_probs[i],
+            torch.zeros_like(student_log_probs[i]),
+        )
         advantages[i] = adv - args.opd_kl_coef * reverse_kl
         reverse_kls.append(reverse_kl)
 

@@ -1,8 +1,28 @@
+import logging
+
 import aiohttp
 import torch
 
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.types import Sample
+
+
+logger = logging.getLogger(__name__)
+
+OPD_TEACHER_LOGPROB_FAILURE_SENTINEL = -1e9
+
+
+def _failed_teacher_logprob_payload(response_length: int, error: str | None = None):
+    payload = {
+        "meta_info": {
+            "input_token_logprobs": [(None,)]
+            + [(OPD_TEACHER_LOGPROB_FAILURE_SENTINEL,) for _ in range(response_length)]
+        },
+        "opd_teacher_logprob_failed": True,
+    }
+    if error is not None:
+        payload["opd_teacher_logprob_error"] = error
+    return payload
 
 
 async def reward_func(args, sample, **kwargs):
@@ -23,10 +43,34 @@ async def reward_func(args, sample, **kwargs):
         payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
 
     session_kwargs = {}
-    async with aiohttp.ClientSession(**session_kwargs) as session:
-        async with session.post(args.rm_url, json=payload) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+    try:
+        async with aiohttp.ClientSession(**session_kwargs) as session:
+            async with session.post(args.rm_url, json=payload) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+    except Exception as exc:
+        logger.warning("OPD teacher logprob request failed; filling sentinel logprobs: %s", exc)
+        return _failed_teacher_logprob_payload(sample.response_length, error=repr(exc))
+
+
+def _extract_teacher_log_probs(reward, response_length: int) -> tuple[torch.Tensor, bool]:
+    try:
+        input_token_logprobs = reward["meta_info"]["input_token_logprobs"]
+        logprobs = [item[0] for item in input_token_logprobs[1:]]
+        if len(logprobs) < response_length:
+            raise ValueError(
+                f"teacher logprobs length {len(logprobs)} is shorter than response_length {response_length}"
+            )
+        if response_length == 0:
+            return torch.empty((0,), dtype=torch.float32), bool(reward.get("opd_teacher_logprob_failed", False))
+        teacher_log_probs = torch.tensor(logprobs, dtype=torch.float32)[-response_length:]
+        return teacher_log_probs, bool(reward.get("opd_teacher_logprob_failed", False))
+    except Exception as exc:
+        logger.warning("Failed to parse OPD teacher logprobs; filling sentinel logprobs: %s", exc)
+        return (
+            torch.full((response_length,), OPD_TEACHER_LOGPROB_FAILURE_SENTINEL, dtype=torch.float32),
+            True,
+        )
 
 
 def post_process_rewards(args, samples: list[Sample], **kwargs):
@@ -45,18 +89,25 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     response_lengths = [sample.response_length for sample in samples]
 
-    # Extract teacher log-probs from the sglang response
-    teacher_log_probs = [
-        torch.tensor([item[0] for item in reward["meta_info"]["input_token_logprobs"][1:]], dtype=torch.float32)
-        for reward in raw_rewards
-    ]
-    teacher_log_probs = [
-        torch.empty((0,), dtype=torch.float32) if response_length == 0 else t_log_prob[-response_length:]
-        for t_log_prob, response_length in zip(teacher_log_probs, response_lengths, strict=False)
-    ]
+    teacher_log_probs = []
+    teacher_failures = []
+    failed_samples = 0
+    failed_tokens = 0
+    for reward, response_length in zip(raw_rewards, response_lengths, strict=False):
+        t_log_probs, failed = _extract_teacher_log_probs(reward, response_length)
+        teacher_log_probs.append(t_log_probs)
+        teacher_failures.append(failed)
+        if failed:
+            failed_samples += 1
+            failed_tokens += response_length
 
-    for sample, t_log_probs in zip(samples, teacher_log_probs, strict=False):
+    for sample, t_log_probs, failed in zip(samples, teacher_log_probs, teacher_failures, strict=False):
         sample.teacher_log_probs = t_log_probs
+        if failed or torch.eq(t_log_probs, OPD_TEACHER_LOGPROB_FAILURE_SENTINEL).any().item():
+            sample.metadata["opd_teacher_logprob_failed"] = True
+
+    if failed_samples:
+        logger.warning("OPD teacher logprob failures: samples=%s tokens=%s", failed_samples, failed_tokens)
 
     # Return scalar rewards for GRPO/PPO advantage estimator
     # For pure on-policy distillation, we use 0.0 as the task reward.
