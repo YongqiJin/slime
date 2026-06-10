@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import warnings
 from typing import Any
@@ -1117,6 +1118,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "When set, slime selects teacher URLs from this config instead of --rm-url."
                 ),
             )
+            parser.add_argument(
+                "--opd-correctness-balance-mode",
+                type=str,
+                choices=["global", "per_group"],
+                default="global",
+                help=(
+                    "Balance mode for slime.rollout.filter_hub.correctness_balance.rollout_sample_filter. "
+                    "'global' balances across the rollout batch; 'per_group' balances inside each prompt group."
+                ),
+            )
+            parser.add_argument(
+                "--opd-correctness-balance-ratio",
+                type=float,
+                default=1.0,
+                help=(
+                    "Correct:incorrect target ratio for OPD correctness balance. "
+                    "Use 1.0 for 1:1, 0.0 for incorrect-only, and inf for correct-only."
+                ),
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1752,6 +1772,10 @@ def _validate_update_weight_args(args) -> None:
 
 
 def _validate_opd_args(args) -> None:
+    balance_ratio = getattr(args, "opd_correctness_balance_ratio", 1.0)
+    if math.isnan(balance_ratio) or balance_ratio < 0:
+        raise ValueError("--opd-correctness-balance-ratio must be non-negative and not NaN.")
+
     if args.use_opd:
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
