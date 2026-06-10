@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
+import subprocess
 import sys
 import types
 from argparse import Namespace
@@ -41,7 +43,14 @@ class _SuccessfulPostContext:
         pass
 
     async def json(self):
-        return {"meta_info": {"input_token_logprobs": [(None,), (-0.2,)]}}
+        return {
+            "meta_info": {
+                "input_token_logprobs": [
+                    (None,),
+                    (-0.2,),
+                ]
+            }
+        }
 
 
 class _CapturingClientSession:
@@ -99,6 +108,23 @@ def _metric_args():
     return types.SimpleNamespace(log_reward_category=None, advantage_estimator="ppo")
 
 
+def _load_teacher_pool_module():
+    module_path = (
+        REPO_ROOT
+        / "examples"
+        / "on_policy_distillation"
+        / "qwen3_5_multidomain"
+        / "teacher_pool.py"
+    )
+    module_name = "test_qwen35_teacher_pool"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.unit
 def test_load_teacher_runtime_config_parses_schema(tmp_path):
     config_path = _write_config(tmp_path / "teacher_runtime.json", _valid_config())
@@ -116,7 +142,10 @@ def test_load_teacher_runtime_config_parses_schema(tmp_path):
 def test_select_teacher_precedence_teacher_name_then_domain_then_default(tmp_path):
     config = load_teacher_runtime_config(_write_config(tmp_path / "teacher_runtime.json", _valid_config()))
 
-    by_name = select_teacher_for_sample(config, Sample(metadata={"teacher_model_name": "general", "domain": "math"}))
+    by_name = select_teacher_for_sample(
+        config,
+        Sample(metadata={"teacher_model_name": "general", "domain": "math"}),
+    )
     by_domain = select_teacher_for_sample(config, Sample(metadata={"domain": "math"}))
     by_default = select_teacher_for_sample(config, Sample(metadata={"domain": "unknown"}))
 
@@ -219,6 +248,225 @@ def test_opd_teacher_distribution_metrics_use_selected_teacher_metadata():
     assert metrics["opd_teacher/known_ratio"] == 0.75
     assert metrics["opd_teacher/name_math"] == pytest.approx(2 / 3)
     assert metrics["opd_teacher/name_code_domain"] == pytest.approx(1 / 3)
+
+
+@pytest.mark.unit
+def test_teacher_pool_generated_runtime_matches_loader_schema(tmp_path):
+    teacher_pool = _load_teacher_pool_module()
+    _, runtime = teacher_pool._teacher_entries(
+        {
+            "default_teacher": "general",
+            "teachers": [
+                {
+                    "name": "math",
+                    "domains": ["math"],
+                    "model_path": "/tmp/math",
+                    "instances": [{"host": "127.0.0.1", "port": 31001}],
+                },
+                {
+                    "name": "general",
+                    "domains": ["general"],
+                    "model_path": "/tmp/general",
+                    "instances": [{"host": "127.0.0.1", "port": 31002}],
+                },
+            ],
+        },
+        tmp_path,
+    )
+    config_path = tmp_path / "teacher_runtime.json"
+    config_path.write_text(json.dumps(runtime))
+
+    config = load_teacher_runtime_config(str(config_path))
+
+    assert config.default_teacher == "general"
+    assert config.teachers_by_name["math"].urls == ("http://127.0.0.1:31001/generate",)
+
+
+@pytest.mark.unit
+def test_teacher_pool_supports_local_and_multi_host_runtime(tmp_path):
+    teacher_pool = _load_teacher_pool_module()
+    entries, runtime = teacher_pool._teacher_entries(
+        {
+            "default_teacher": "general",
+            "teachers": [
+                {
+                    "name": "general",
+                    "domains": ["general"],
+                    "model_path": "/tmp/general",
+                    "instances": [{"host": "127.0.0.1", "port": 31001}],
+                },
+                {
+                    "name": "code",
+                    "domains": ["code"],
+                    "model_path": "/tmp/code",
+                    "instances": [
+                        {"host": "10.0.0.12", "public_host": "10.0.0.12", "port": 31002, "tp": 2},
+                        {"host": "10.0.0.13", "public_host": "teacher-code-b", "port": 31003, "tp": 2},
+                    ],
+                },
+            ],
+        },
+        tmp_path,
+    )
+    config_path = tmp_path / "teacher_runtime.json"
+    config_path.write_text(json.dumps(runtime))
+
+    config = load_teacher_runtime_config(str(config_path))
+
+    assert [entry["host"] for entry in entries] == ["127.0.0.1", "10.0.0.12", "10.0.0.13"]
+    assert [entry["tp"] for entry in entries] == [1, 2, 2]
+    assert config.teachers_by_name["code"].urls == (
+        "http://10.0.0.12:31002/generate",
+        "http://teacher-code-b:31003/generate",
+    )
+
+
+@pytest.mark.unit
+def test_teacher_pool_dispatches_local_and_remote_commands(monkeypatch):
+    teacher_pool = _load_teacher_pool_module()
+    calls = []
+
+    monkeypatch.setattr(teacher_pool.subprocess, "run", lambda command, check: calls.append((command, check)))
+
+    teacher_pool._run_on_host("127.0.0.1", "echo local", ssh_user="root", dry_run=False)
+    teacher_pool._run_on_host("10.0.0.12", "echo remote", ssh_user="root", dry_run=False)
+
+    assert calls == [
+        (["bash", "-lc", "echo local"], True),
+        (["ssh", "root@10.0.0.12", "echo remote"], True),
+    ]
+
+
+@pytest.mark.unit
+def test_teacher_pool_launch_command_detaches_from_calling_session(tmp_path):
+    teacher_pool = _load_teacher_pool_module()
+    entries, _ = teacher_pool._teacher_entries(
+        {
+            "teachers": [
+                {
+                    "name": "math",
+                    "model_path": "/tmp/math",
+                    "instances": [{"host": "127.0.0.1", "port": 31001, "gpus": "0,1", "tp": 2}],
+                }
+            ],
+        },
+        tmp_path,
+    )
+
+    command = teacher_pool._launch_command(entries[0], {"python": "python3", "sglang_module": "sglang.launch_server"})
+
+    assert "CUDA_VISIBLE_DEVICES=0,1 nohup setsid python3 -m sglang.launch_server" in command
+    assert "> " in command
+    assert "2>&1 < /dev/null & echo $!" in command
+
+
+@pytest.mark.unit
+def test_teacher_pool_refuses_to_write_runtime_when_post_health_check_fails(monkeypatch, tmp_path):
+    teacher_pool = _load_teacher_pool_module()
+    run_dir = tmp_path / "run"
+    config_path = tmp_path / "teachers.yaml"
+    config_path.write_text(
+        json.dumps(
+            {
+                "run": {"post_health_stability_seconds": 1},
+                "teachers": [
+                    {
+                        "name": "math",
+                        "model_path": "/tmp/math",
+                        "instances": [{"host": "127.0.0.1", "port": 31001}],
+                    }
+                ],
+            }
+        )
+    )
+
+    monkeypatch.setattr(teacher_pool, "_run_on_host", lambda *args, **kwargs: None)
+    monkeypatch.setattr(teacher_pool, "_wait_for_health", lambda *args, **kwargs: None)
+
+    def fail_stability(*args, **kwargs):
+        raise RuntimeError("dead teacher")
+
+    monkeypatch.setattr(teacher_pool, "_wait_for_post_health_stability", fail_stability)
+
+    with pytest.raises(RuntimeError, match="dead teacher"):
+        teacher_pool.start(types.SimpleNamespace(config=str(config_path), run_dir=str(run_dir), dry_run=False))
+
+    assert not (run_dir / teacher_pool.RUNTIME_FILE).exists()
+    assert not (run_dir / teacher_pool.PROCESS_FILE).exists()
+
+
+@pytest.mark.unit
+def test_teacher_pool_stop_reuses_start_ssh_user_from_process_file(monkeypatch, tmp_path):
+    teacher_pool = _load_teacher_pool_module()
+    calls = []
+    run_dir = tmp_path / "teachers"
+    run_dir.mkdir()
+    pid_path = run_dir / "remote.pid"
+    process_path = run_dir / teacher_pool.PROCESS_FILE
+    process_path.write_text(
+        json.dumps(
+            {
+                "ssh_user": "root",
+                "processes": [
+                    {
+                        "host": "10.0.0.12",
+                        "pid_path": str(pid_path),
+                    }
+                ],
+            }
+        )
+    )
+
+    monkeypatch.setattr(teacher_pool.subprocess, "run", lambda command, check: calls.append((command, check)))
+
+    teacher_pool.stop(types.SimpleNamespace(run_dir=str(run_dir), ssh_user=None, dry_run=False))
+
+    assert calls == [
+        (
+            [
+                "ssh",
+                "root@10.0.0.12",
+                f"if [ -f {pid_path} ]; then kill $(cat {pid_path}) 2>/dev/null || true; rm -f {pid_path}; fi",
+            ],
+            True,
+        )
+    ]
+
+
+@pytest.mark.unit
+def test_stop_teachers_wrapper_accepts_dry_run_without_explicit_run_dir(tmp_path):
+    run_dir = tmp_path / "teachers"
+    run_dir.mkdir()
+    (run_dir / "teacher_processes.json").write_text('{"processes": []}\n')
+    script = REPO_ROOT / "examples" / "on_policy_distillation" / "qwen3_5_multidomain" / "stop_teachers.sh"
+
+    env = {**os.environ, "OPD_TEACHER_RUN_DIR": str(run_dir)}
+    subprocess.run(["bash", str(script), "--dry-run"], check=True, env=env)
+    subprocess.run(["bash", str(script), str(run_dir), "--dry-run"], check=True)
+
+
+@pytest.mark.unit
+def test_teacher_pool_rejects_multiteacher_runtime_without_default(tmp_path):
+    teacher_pool = _load_teacher_pool_module()
+
+    with pytest.raises(ValueError, match="multiple teachers must define default_teacher"):
+        teacher_pool._teacher_entries(
+            {
+                "teachers": [
+                    {
+                        "name": "math",
+                        "model_path": "/tmp/math",
+                        "instances": [{"host": "127.0.0.1", "port": 31001}],
+                    },
+                    {
+                        "name": "general",
+                        "model_path": "/tmp/general",
+                        "instances": [{"host": "127.0.0.1", "port": 31002}],
+                    },
+                ],
+            },
+            tmp_path,
+        )
 
 
 @pytest.mark.unit
@@ -350,9 +598,7 @@ def test_sglang_opd_requires_teacher_config_or_rm_url(monkeypatch):
 def test_sglang_opd_teacher_config_does_not_require_rm_url(monkeypatch, tmp_path):
     module = _load_slime_arguments_module(monkeypatch)
     config_path = tmp_path / "teachers.json"
-    config_path.write_text(
-        '{"default_teacher":"default","teachers":[{"name":"default","urls":["http://teacher"]}]}\n'
-    )
+    config_path.write_text('{"default_teacher":"default","teachers":[{"name":"default","urls":["http://teacher"]}]}\n')
     args = _minimal_validate_args(opd_teacher_config=str(config_path), rm_url=None)
 
     module._validate_opd_args(args)

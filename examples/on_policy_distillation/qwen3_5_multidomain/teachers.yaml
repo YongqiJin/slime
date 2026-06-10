@@ -1,0 +1,59 @@
+# Example Qwen3.5 OPD teacher pool config.
+#
+# Start with:
+#   OPD_TEACHER_RUN_DIR=/tmp/slime-opd-teachers bash start_teachers.sh teachers.yaml
+#
+# Values like ${BASE_FOLDER} are expanded by teacher_pool.py at runtime.
+
+default_teacher: general
+
+run:
+  ssh_user: root
+  python: python3
+  startup_timeout_seconds: 600
+  health_interval_seconds: 5
+  post_health_stability_seconds: 5
+  sglang_module: sglang.launch_server
+
+teachers:
+  - name: math
+    domains: [math, gsm8k, aime]
+    model_path: ${BASE_FOLDER}/Qwen3.5-27B
+    metadata:
+      model: Qwen3.5-27B
+      role: math_teacher
+    instances:
+      - host: 127.0.0.1
+        gpus: "0,1"
+        port: 31001
+        tp: 2
+        mem_fraction_static: 0.75
+
+  - name: general
+    domains: [general]
+    model_path: ${BASE_FOLDER}/Qwen3.5-27B
+    metadata:
+      model: Qwen3.5-27B
+      role: default_teacher
+    instances:
+      - host: 127.0.0.1
+        gpus: "2,3"
+        port: 31002
+        tp: 2
+        mem_fraction_static: 0.75
+
+# Multi-host example:
+#  - name: code
+#    domains: [code]
+#    model_path: ${BASE_FOLDER}/Qwen3.5-27B
+#    instances:
+#      - host: 10.0.0.12
+#        public_host: 10.0.0.12
+#        gpus: "0,1"
+#        port: 31003
+#        tp: 2
+#      - host: 10.0.0.13
+#        public_host: 10.0.0.13
+#        gpus: "0,1"
+#        port: 31003
+#        tp: 2
