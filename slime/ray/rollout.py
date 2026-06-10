@@ -1348,6 +1348,13 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     if args.advantage_estimator == "ppo":
         return {}
 
+    def _is_numeric_reward(reward):
+        return isinstance(reward, (int, float)) and not isinstance(reward, bool) and np.isfinite(reward)
+
+    sample_rewards = [sample.get_reward_value(args) for sample in all_samples]
+    if any(not _is_numeric_reward(reward) for reward in sample_rewards):
+        return {}
+
     def _is_zero_std(samples: list[Sample]):
         rewards = [sample.get_reward_value(args) for sample in samples]
         return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
