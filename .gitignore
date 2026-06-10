@@ -193,3 +193,6 @@ glm/
 _examples_synced/
 .env
 .DS_Store
+
+codex_md/
+docs/opd_migration_issues/progress/

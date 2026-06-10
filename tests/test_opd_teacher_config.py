@@ -125,6 +125,23 @@ def _load_teacher_pool_module():
     return module
 
 
+def _load_qwen35_launch_module():
+    module_path = (
+        REPO_ROOT
+        / "examples"
+        / "on_policy_distillation"
+        / "qwen3_5_multidomain"
+        / "launch.py"
+    )
+    module_name = "test_qwen35_launch"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.unit
 def test_load_teacher_runtime_config_parses_schema(tmp_path):
     config_path = _write_config(tmp_path / "teacher_runtime.json", _valid_config())
@@ -443,6 +460,280 @@ def test_stop_teachers_wrapper_accepts_dry_run_without_explicit_run_dir(tmp_path
     env = {**os.environ, "OPD_TEACHER_RUN_DIR": str(run_dir)}
     subprocess.run(["bash", str(script), "--dry-run"], check=True, env=env)
     subprocess.run(["bash", str(script), str(run_dir), "--dry-run"], check=True)
+
+
+def _make_qwen35_production_preflight_files(tmp_path: Path):
+    base = tmp_path / "base"
+    for name in ["Qwen3.5-27B", "Qwen3.5-27B_torch_dist"]:
+        (base / name).mkdir(parents=True)
+    data_file = tmp_path / "train.parquet"
+    data_file.write_text("")
+    return base, data_file
+
+
+def _make_qwen35_smoke_preflight_files(tmp_path: Path):
+    base = tmp_path / "base"
+    for name in ["Qwen3.5-9B", "Qwen3.5-9B_torch_dist"]:
+        (base / name).mkdir(parents=True)
+    data_file = tmp_path / "smoke.parquet"
+    data_file.write_text("")
+    return base, data_file
+
+
+@pytest.mark.unit
+def test_preflight_allows_teacher_pool_before_runtime_config_exists(tmp_path):
+    base, data_file = _make_qwen35_production_preflight_files(tmp_path)
+    run_dir = tmp_path / "teacher-run"
+    script = REPO_ROOT / "examples" / "on_policy_distillation" / "qwen3_5_multidomain" / "preflight.sh"
+
+    env = {
+        **os.environ,
+        "BASE_FOLDER": str(base),
+        "DATA_FILE": str(data_file),
+        "MASTER_ADDR": "127.0.0.1",
+        "OPD_TEACHER_RUN_DIR": str(run_dir),
+    }
+    result = subprocess.run(["bash", str(script), "production"], check=True, env=env, text=True, capture_output=True)
+
+    assert "teacher_runtime_config=not yet generated" in result.stderr
+    assert "slime_checkpoint=will_initialize_from_ref_load_and_save" in result.stdout
+    assert "preflight_ok mode=production" in result.stdout
+
+
+@pytest.mark.unit
+def test_preflight_reports_existing_slime_checkpoint(tmp_path):
+    base, data_file = _make_qwen35_production_preflight_files(tmp_path)
+    slime_dir = base / "Qwen3.5-27B_slime"
+    slime_dir.mkdir()
+    (slime_dir / "latest_checkpointed_iteration.txt").write_text("release")
+    script = REPO_ROOT / "examples" / "on_policy_distillation" / "qwen3_5_multidomain" / "preflight.sh"
+
+    env = {
+        **os.environ,
+        "BASE_FOLDER": str(base),
+        "DATA_FILE": str(data_file),
+        "MASTER_ADDR": "127.0.0.1",
+        "TEACHER_RM_URL": "http://127.0.0.1:31001/generate",
+    }
+    result = subprocess.run(["bash", str(script), "production"], check=True, env=env, text=True, capture_output=True)
+
+    assert f"slime_checkpoint=existing:{slime_dir}" in result.stdout
+    assert "preflight_ok mode=production" in result.stdout
+
+
+@pytest.mark.unit
+def test_preflight_single_teacher_rm_url_does_not_require_teacher_source_config(tmp_path):
+    base, data_file = _make_qwen35_production_preflight_files(tmp_path)
+    script = REPO_ROOT / "examples" / "on_policy_distillation" / "qwen3_5_multidomain" / "preflight.sh"
+
+    env = {
+        **os.environ,
+        "BASE_FOLDER": str(base),
+        "DATA_FILE": str(data_file),
+        "MASTER_ADDR": "127.0.0.1",
+        "TEACHER_RM_URL": "http://127.0.0.1:31001/generate",
+        "TEACHERS_CONFIG": str(tmp_path / "missing-teachers.yaml"),
+    }
+    result = subprocess.run(["bash", str(script), "production"], check=True, env=env, text=True, capture_output=True)
+
+    assert "teacher_source_config=skipped_missing_for_single_teacher_rm_url" in result.stdout
+    assert "teacher_rm_url=http://127.0.0.1:31001/generate" in result.stdout
+    assert "preflight_ok mode=production" in result.stdout
+
+
+@pytest.mark.unit
+def test_smoke_preflight_requires_hostfile_worker_distinct_from_master(tmp_path):
+    base, data_file = _make_qwen35_smoke_preflight_files(tmp_path)
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("127.0.0.1\n")
+    script = REPO_ROOT / "examples" / "on_policy_distillation" / "qwen3_5_multidomain" / "preflight.sh"
+
+    env = {
+        **os.environ,
+        "BASE_FOLDER": str(base),
+        "SMOKE_DATA_FILE": str(data_file),
+        "MASTER_ADDR": "127.0.0.1",
+        "HOSTFILE": str(hostfile),
+        "TEACHER_RM_URL": "http://127.0.0.1:31001/generate",
+    }
+    result = subprocess.run(["bash", str(script), "smoke"], env=env, text=True, capture_output=True)
+
+    assert result.returncode != 0
+    assert "worker IP different from MASTER_ADDR" in result.stderr
+
+
+@pytest.mark.unit
+def test_smoke_preflight_accepts_worker_only_hostfile(tmp_path):
+    base, data_file = _make_qwen35_smoke_preflight_files(tmp_path)
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("10.0.0.2 slots=8\n")
+    script = REPO_ROOT / "examples" / "on_policy_distillation" / "qwen3_5_multidomain" / "preflight.sh"
+
+    env = {
+        **os.environ,
+        "BASE_FOLDER": str(base),
+        "SMOKE_DATA_FILE": str(data_file),
+        "MASTER_ADDR": "10.0.0.1",
+        "HOSTFILE": str(hostfile),
+        "TEACHER_RM_URL": "http://127.0.0.1:31001/generate",
+    }
+    result = subprocess.run(["bash", str(script), "smoke"], check=True, env=env, text=True, capture_output=True)
+
+    assert "slime_checkpoint=will_initialize_from_ref_load_and_save" in result.stdout
+    assert "preflight_ok mode=smoke" in result.stdout
+
+
+@pytest.mark.unit
+def test_qwen35_train_entry_scripts_stay_short():
+    example_dir = REPO_ROOT / "examples" / "on_policy_distillation" / "qwen3_5_multidomain"
+
+    for name in ["train_27b.sh", "smoke_2node.sh"]:
+        lines = (example_dir / name).read_text().splitlines()
+        assert len(lines) <= 10
+        assert "launch.py" in lines[-1]
+
+
+@pytest.mark.unit
+def test_qwen35_launcher_builds_production_and_smoke_commands(tmp_path):
+    launch = _load_qwen35_launch_module()
+    base_env = {
+        "BASE_FOLDER": "/models",
+        "MASTER_ADDR": "10.0.0.1",
+        "TEACHER_RM_URL": "http://teacher/generate",
+    }
+
+    production_cmd = launch._build_train_cmd(
+        REPO_ROOT,
+        "production",
+        {
+            **base_env,
+            "DATA_FILE": "/data/train.parquet",
+        },
+    )
+    smoke_cmd = launch._build_train_cmd(
+        REPO_ROOT,
+        "smoke",
+        {
+            **base_env,
+            "SMOKE_DATA_FILE": "/data/smoke.parquet",
+            "SMOKE_MODEL_SIZE": "9B",
+        },
+    )
+
+    assert "--ci-test" not in production_cmd
+    assert "--ci-test" in smoke_cmd
+    assert "/models/Qwen3.5-27B" in production_cmd
+    assert "/models/Qwen3.5-9B" in smoke_cmd
+    assert "--spec" in production_cmd
+    for cmd in [production_cmd, smoke_cmd]:
+        assert cmd[cmd.index("--actor-num-gpus-per-node") + 1] == "8"
+        assert cmd[cmd.index("--num-gpus-per-node") + 1] == "8"
+    assert all("Welcome to PAI DSW" not in arg for arg in production_cmd + smoke_cmd)
+    assert all("____" not in arg for arg in production_cmd + smoke_cmd)
+    assert "http://teacher/generate" in production_cmd
+    assert "http://teacher/generate" in smoke_cmd
+
+
+@pytest.mark.unit
+def test_qwen35_launcher_can_omit_label_key_for_unlabeled_prompt_data(tmp_path):
+    launch = _load_qwen35_launch_module()
+
+    smoke_cmd = launch._build_train_cmd(
+        REPO_ROOT,
+        "smoke",
+        {
+            "BASE_FOLDER": "/models",
+            "MASTER_ADDR": "10.0.0.1",
+            "TEACHER_RM_URL": "http://teacher/generate",
+            "SMOKE_DATA_FILE": "/data/smoke.parquet",
+            "LABEL_KEY": "",
+        },
+    )
+
+    assert "--input-key" in smoke_cmd
+    assert "--label-key" not in smoke_cmd
+
+
+@pytest.mark.unit
+def test_qwen35_shell_entrypoints_support_dry_run(tmp_path):
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("10.0.0.2 slots=8\n")
+    example_dir = REPO_ROOT / "examples" / "on_policy_distillation" / "qwen3_5_multidomain"
+    env = {
+        **os.environ,
+        "BASE_FOLDER": "/models",
+        "DATA_FILE": "/data/train.parquet",
+        "SMOKE_DATA_FILE": "/data/smoke.parquet",
+        "MASTER_ADDR": "10.0.0.1",
+        "HOSTFILE": str(hostfile),
+        "TEACHER_RM_URL": "http://teacher/generate",
+    }
+
+    production = subprocess.run(
+        ["bash", str(example_dir / "train_27b.sh"), "--dry-run"],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    smoke = subprocess.run(
+        ["bash", str(example_dir / "smoke_2node.sh"), "--dry-run"],
+        check=True,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "ray job submit" in production.stdout
+    assert "Qwen3.5-27B" in production.stdout
+    assert "ray job submit" in smoke.stdout
+    assert "Qwen3.5-9B" in smoke.stdout
+    assert "--ci-test" in smoke.stdout
+
+
+@pytest.mark.unit
+def test_qwen35_launcher_can_skip_worker_ssh_for_prestarted_ray(tmp_path, capsys):
+    launch = _load_qwen35_launch_module()
+    hostfile = tmp_path / "hostfile"
+    hostfile.write_text("10.0.0.2 slots=8\n")
+
+    launch._start_ray(
+        REPO_ROOT,
+        {
+            "MASTER_ADDR": "10.0.0.1",
+            "HOSTFILE": str(hostfile),
+            "SLIME_RAY_WORKERS_PRESTARTED": "1",
+        },
+        require_hostfile=True,
+        dry_run=True,
+    )
+
+    output = capsys.readouterr().out
+    assert "ray start --head" in output
+    assert "Skipping Ray worker SSH startup" in output
+    assert "ssh root@10.0.0.2" not in output
+
+
+@pytest.mark.unit
+def test_qwen35_launcher_waits_for_expected_ray_nodes(monkeypatch, capsys):
+    launch = _load_qwen35_launch_module()
+    fake_ray = types.ModuleType("ray")
+    fake_ray.init = lambda **kwargs: None
+    fake_ray.nodes = lambda: [{"Alive": True}, {"Alive": True}]
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    launch._wait_for_ray_nodes({"SLIME_RAY_EXPECTED_NODES": "2"}, dry_run=False)
+
+    assert "Ray cluster ready: 2/2 alive nodes" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_qwen35_launcher_ray_node_wait_is_visible_in_dry_run(capsys):
+    launch = _load_qwen35_launch_module()
+
+    launch._wait_for_ray_nodes({"SLIME_RAY_EXPECTED_NODES": "2"}, dry_run=True)
+
+    assert "Waiting for Ray nodes: expected=2" in capsys.readouterr().out
 
 
 @pytest.mark.unit
