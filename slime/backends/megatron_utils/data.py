@@ -299,6 +299,7 @@ def log_rollout_data(
                 "rollout_ids",
                 "rollout_mask_sums",
                 "rollout_routed_experts",
+                "response_correct",
                 "max_seq_lens",
                 "global_batch_sizes",
                 "num_microbatches",

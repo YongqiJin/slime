@@ -752,6 +752,9 @@ class RolloutManager:
                 for sample in samples
             ]
 
+        if any(_get_response_correct(sample) is not None for sample in samples):
+            train_data["response_correct"] = [_get_response_correct(sample) for sample in samples]
+
         # For rollout buffer
         if samples[0].metadata and "round_number" in samples[0].metadata:
             train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
@@ -819,6 +822,7 @@ class RolloutManager:
                 "rollout_mask_sums",
                 "rollout_log_probs",
                 "rollout_routed_experts",
+                "response_correct",
                 "prompt",
                 "teacher_log_probs",
             ]:
@@ -1252,6 +1256,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_response_correct_metrics(samples)
     log_dict |= _compute_opd_teacher_metrics(samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
@@ -1397,6 +1402,22 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
+def _get_response_correct(sample: Sample) -> bool | None:
+    value = sample.metadata.get("response_correct") if isinstance(sample.metadata, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def _compute_response_correct_metrics(all_samples: list[Sample]):
+    response_correct = [_get_response_correct(sample) for sample in all_samples]
+    known = [value for value in response_correct if value is not None]
+    if not known:
+        return {}
+    return {
+        "response_correct/known_ratio": len(known) / len(all_samples),
+        "response_correct/accuracy": sum(1 for value in known if value) / len(known),
+    }
+
 
 def _get_opd_teacher_name(sample: Sample) -> str | None:
     value = sample.metadata.get("opd_teacher_name") if isinstance(sample.metadata, dict) else None
