@@ -622,6 +622,8 @@ def test_qwen35_launcher_builds_production_and_smoke_commands(tmp_path):
 
     assert "--ci-test" not in production_cmd
     assert "--ci-test" in smoke_cmd
+    assert "--ci-disable-kl-checker" not in production_cmd
+    assert "--ci-disable-kl-checker" in smoke_cmd
     assert "/models/Qwen3.5-27B" in production_cmd
     assert "/models/Qwen3.5-9B" in smoke_cmd
     assert "--spec" in production_cmd
@@ -689,6 +691,7 @@ def test_qwen35_shell_entrypoints_support_dry_run(tmp_path):
     assert "ray job submit" in smoke.stdout
     assert "Qwen3.5-9B" in smoke.stdout
     assert "--ci-test" in smoke.stdout
+    assert "--ci-disable-kl-checker" in smoke.stdout
 
 
 @pytest.mark.unit
