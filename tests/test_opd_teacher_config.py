@@ -617,6 +617,7 @@ def test_qwen35_launcher_builds_production_and_smoke_commands(tmp_path):
             **base_env,
             "SMOKE_DATA_FILE": "/data/smoke.parquet",
             "SMOKE_MODEL_SIZE": "9B",
+            "SGLANG_ROUTER_PORT": "39817",
         },
     )
 
@@ -624,6 +625,7 @@ def test_qwen35_launcher_builds_production_and_smoke_commands(tmp_path):
     assert "--ci-test" in smoke_cmd
     assert "--ci-disable-kl-checker" not in production_cmd
     assert "--ci-disable-kl-checker" in smoke_cmd
+    assert smoke_cmd[smoke_cmd.index("--sglang-router-port") + 1] == "39817"
     assert "/models/Qwen3.5-27B" in production_cmd
     assert "/models/Qwen3.5-9B" in smoke_cmd
     assert "--spec" in production_cmd
