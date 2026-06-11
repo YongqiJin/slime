@@ -628,6 +628,8 @@ def test_qwen35_launcher_builds_production_and_smoke_commands(tmp_path):
     assert "--no-load-optim" not in production_cmd
     assert "--no-load-optim" in smoke_cmd
     assert "--no-save-optim" in smoke_cmd
+    assert "--start-rollout-id" not in production_cmd
+    assert smoke_cmd[smoke_cmd.index("--start-rollout-id") + 1] == "0"
     assert int(smoke_cmd[smoke_cmd.index("--num-rollout") + 1]) >= 3
     assert smoke_cmd[smoke_cmd.index("--sglang-router-port") + 1] == "39817"
     assert "/models/Qwen3.5-27B" in production_cmd

@@ -303,6 +303,8 @@ def _build_train_cmd(root: Path, mode: str, env: dict[str, str]) -> list[str]:
             _env(env, "SGLANG_MEM_FRACTION_STATIC", "0.6"),
             "--ci-test",
             "--ci-disable-kl-checker",
+            "--start-rollout-id",
+            "0",
             "--no-load-optim",
             "--no-load-rng",
             "--finetune",
