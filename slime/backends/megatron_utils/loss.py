@@ -1317,11 +1317,11 @@ def policy_loss_function(
         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
 
-    if "opd_margin_shift" in batch:
+    if "opd_margin_shift" in batch and batch["opd_margin_shift"]:
         opd_margin_shift = torch.cat(batch["opd_margin_shift"], dim=0)
         reported_loss["opd_margin_shift"] = sum_of_sample_mean(opd_margin_shift).clone().detach()
 
-    if "opd_margin_affected" in batch:
+    if "opd_margin_affected" in batch and batch["opd_margin_affected"]:
         opd_margin_affected = torch.cat(batch["opd_margin_affected"], dim=0)
         reported_loss["opd_margin_affected"] = sum_of_sample_mean(opd_margin_affected).clone().detach()
 

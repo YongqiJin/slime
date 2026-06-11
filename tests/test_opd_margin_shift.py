@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import slime.backends.megatron_utils.loss as loss_module
-from slime.backends.megatron_utils.loss import apply_opd_margin_shift_to_advantages
+from slime.backends.megatron_utils.loss import apply_opd_margin_shift_to_advantages, policy_loss_function
 from slime.ray.rollout import RolloutManager
 from slime.utils.types import Sample
 
@@ -298,6 +298,50 @@ def test_minmax_opd_margin_shift_supports_incorrect_down_direction():
     assert torch.equal(advantages[1], torch.tensor([2.0]))
     assert torch.equal(advantages[2], torch.tensor([-0.5]))
     assert torch.equal(advantages[3], torch.tensor([-2.5]))
+
+
+@pytest.mark.unit
+def test_policy_loss_ignores_absent_margin_shift_metrics(monkeypatch):
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *args, **kwargs: (
+            None,
+            {
+                "log_probs": [torch.tensor([0.1])],
+                "entropy": [torch.tensor([0.0])],
+            },
+        ),
+    )
+    args = Namespace(
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        advantage_estimator="grpo",
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        get_mismatch_metrics=False,
+        use_tis=False,
+        custom_pg_loss_reducer_function_path=None,
+        calculate_per_token_loss=False,
+        entropy_coef=0.0,
+        use_kl_loss=False,
+    )
+    batch = {
+        "advantages": [torch.tensor([1.0])],
+        "log_probs": [torch.tensor([0.1])],
+        "unconcat_tokens": [torch.tensor([1])],
+        "response_lengths": [1],
+        "total_lengths": [1],
+        "loss_masks": [torch.ones(1)],
+        "rollout_mask_sums": [1],
+        "opd_margin_shift": None,
+        "opd_margin_affected": None,
+    }
+
+    _, reported_loss = policy_loss_function(args, batch, torch.zeros(1, 1, 1), lambda tensor: tensor.mean())
+
+    assert "opd_margin_shift" not in reported_loss
+    assert "opd_margin_affected" not in reported_loss
 
 
 @pytest.mark.unit
