@@ -628,6 +628,7 @@ def test_qwen35_launcher_builds_production_and_smoke_commands(tmp_path):
     assert "--no-load-optim" not in production_cmd
     assert "--no-load-optim" in smoke_cmd
     assert "--no-save-optim" in smoke_cmd
+    assert int(smoke_cmd[smoke_cmd.index("--num-rollout") + 1]) >= 3
     assert smoke_cmd[smoke_cmd.index("--sglang-router-port") + 1] == "39817"
     assert "/models/Qwen3.5-27B" in production_cmd
     assert "/models/Qwen3.5-9B" in smoke_cmd
@@ -659,6 +660,24 @@ def test_qwen35_launcher_can_omit_label_key_for_unlabeled_prompt_data(tmp_path):
 
     assert "--input-key" in smoke_cmd
     assert "--label-key" not in smoke_cmd
+
+
+@pytest.mark.unit
+def test_qwen35_smoke_rejects_less_than_three_rollouts(tmp_path):
+    launch = _load_qwen35_launch_module()
+
+    with pytest.raises(SystemExit, match="NUM_ROLLOUT >= 3"):
+        launch._build_train_cmd(
+            REPO_ROOT,
+            "smoke",
+            {
+                "BASE_FOLDER": "/models",
+                "MASTER_ADDR": "10.0.0.1",
+                "TEACHER_RM_URL": "http://teacher/generate",
+                "SMOKE_DATA_FILE": "/data/smoke.parquet",
+                "NUM_ROLLOUT": "2",
+            },
+        )
 
 
 @pytest.mark.unit

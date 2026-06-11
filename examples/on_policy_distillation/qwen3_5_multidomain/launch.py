@@ -73,6 +73,17 @@ def _optional_rollout_args(env: dict[str, str]) -> list[str]:
     return args
 
 
+def _smoke_num_rollout(env: dict[str, str]) -> str:
+    value = _env(env, "NUM_ROLLOUT", "4")
+    try:
+        num_rollout = int(value)
+    except ValueError as exc:
+        raise SystemExit(f"NUM_ROLLOUT must be an integer for smoke, got {value!r}") from exc
+    if num_rollout < 3:
+        raise SystemExit(f"smoke requires NUM_ROLLOUT >= 3, got {num_rollout}")
+    return value
+
+
 def _dataset_key_args(env: dict[str, str]) -> list[str]:
     args = ["--input-key", _env(env, "INPUT_KEY", "prompt")]
     label_key = env["LABEL_KEY"] if "LABEL_KEY" in env else "label"
@@ -265,7 +276,7 @@ def _build_train_cmd(root: Path, mode: str, env: dict[str, str]) -> list[str]:
             "--prompt-data",
             data_file,
             "--num-rollout",
-            _env(env, "NUM_ROLLOUT", "4"),
+            _smoke_num_rollout(env),
             "--rollout-batch-size",
             _env(env, "ROLLOUT_BATCH_SIZE", "2"),
             "--n-samples-per-prompt",
