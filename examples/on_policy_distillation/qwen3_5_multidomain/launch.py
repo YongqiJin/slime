@@ -245,11 +245,13 @@ def _run(command: list[str], dry_run: bool, log_path: Path | None = None) -> Non
     print(f"Logging command output to {log_path}")
     with log_path.open("a", encoding="utf-8") as log_file:
         log_file.write("+ " + shlex.join(display_command) + "\n")
+        log_file.flush()
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         assert process.stdout is not None
         for line in process.stdout:
             print(line, end="")
             log_file.write(line)
+            log_file.flush()
         if process.wait() != 0:
             raise subprocess.CalledProcessError(process.returncode, process.args)
 
