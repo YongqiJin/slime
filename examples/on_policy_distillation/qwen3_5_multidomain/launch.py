@@ -179,12 +179,28 @@ def _runtime_env_json(env: dict[str, str]) -> str:
 
 
 def _redact_command(command: list[str]) -> list[str]:
+    def redact_runtime_env_json(value: str) -> str:
+        try:
+            runtime_env = json.loads(value)
+        except json.JSONDecodeError:
+            return "<redacted>"
+        env_vars = runtime_env.get("env_vars")
+        if isinstance(env_vars, dict):
+            for name in list(env_vars):
+                if any(token in name.upper() for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+                    env_vars[name] = "<redacted>"
+        return json.dumps(runtime_env, separators=(",", ":"))
+
     redacted = []
     redact_next = False
     for item in command:
         if redact_next:
             redacted.append("<redacted>")
             redact_next = False
+            continue
+        if item.startswith("--runtime-env-json="):
+            prefix, value = item.split("=", 1)
+            redacted.append(f"{prefix}={redact_runtime_env_json(value)}")
             continue
         redacted.append(item)
         if item in {"--wandb-key"}:

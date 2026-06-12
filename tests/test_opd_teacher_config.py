@@ -704,10 +704,26 @@ def test_qwen35_smoke_wandb_can_use_online_credentials_or_be_disabled():
 @pytest.mark.unit
 def test_qwen35_launcher_redacts_wandb_key_from_logged_command():
     launch = _load_qwen35_launch_module()
+    runtime_env_json = json.dumps({"env_vars": {"WANDB_API_KEY": "secret", "MASTER_ADDR": "10.0.0.1"}})
 
-    redacted = launch._redact_command(["python3", "train.py", "--wandb-key", "secret", "--use-wandb"])
+    redacted = launch._redact_command(
+        [
+            "ray",
+            "job",
+            f"--runtime-env-json={runtime_env_json}",
+            "--",
+            "python3",
+            "train.py",
+            "--wandb-key",
+            "secret",
+            "--use-wandb",
+        ]
+    )
 
-    assert redacted == ["python3", "train.py", "--wandb-key", "<redacted>", "--use-wandb"]
+    assert redacted[-5:] == ["python3", "train.py", "--wandb-key", "<redacted>", "--use-wandb"]
+    assert "secret" not in " ".join(redacted)
+    assert "<redacted>" in redacted[2]
+    assert "MASTER_ADDR" in redacted[2]
 
 
 @pytest.mark.unit
