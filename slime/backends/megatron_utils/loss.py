@@ -1,3 +1,4 @@
+import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from slime.rollout.on_policy_distillation import OPD_TEACHER_LOGPROB_FAILURE_SENTINEL
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
@@ -29,6 +31,8 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_responses(
@@ -557,18 +561,299 @@ def apply_opd_kl_to_advantages(
     teacher_log_probs = rollout_data.get("teacher_log_probs")
     if teacher_log_probs is None:
         raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
+    if len(teacher_log_probs) != len(advantages) or len(student_log_probs) != len(advantages):
+        raise ValueError(
+            "OPD teacher_log_probs, student_log_probs, and advantages must have the same number of samples."
+        )
 
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
 
     reverse_kls = []
     for i, adv in enumerate(advantages):
-        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+        if teacher_log_probs[i].shape != student_log_probs[i].shape or adv.shape != student_log_probs[i].shape:
+            raise ValueError(
+                "OPD teacher_log_probs, student_log_probs, and advantages must have matching tensor shapes "
+                f"for sample {i}: teacher={tuple(teacher_log_probs[i].shape)} "
+                f"student={tuple(student_log_probs[i].shape)} advantage={tuple(adv.shape)}"
+            )
+        valid_teacher_logprob_mask = teacher_log_probs[i] != OPD_TEACHER_LOGPROB_FAILURE_SENTINEL
+        reverse_kl = torch.where(
+            valid_teacher_logprob_mask,
+            student_log_probs[i] - teacher_log_probs[i],
+            torch.zeros_like(student_log_probs[i]),
+        )
         advantages[i] = adv - args.opd_kl_coef * reverse_kl
         reverse_kls.append(reverse_kl)
 
     # Store reverse KL for logging
     rollout_data["opd_reverse_kl"] = reverse_kls
+
+
+def _is_strict_bool(value: Any) -> bool:
+    return isinstance(value, bool)
+
+
+def _get_response_correct_mask(
+    rollout_data: RolloutBatch,
+    advantages: list[torch.Tensor],
+    loss_masks: list[torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    response_correct = rollout_data.get("response_correct")
+    if response_correct is None:
+        response_correct = [None] * len(advantages)
+    elif len(response_correct) != len(advantages):
+        raise ValueError("response_correct length must match advantages length for OPD margin shift.")
+
+    device = advantages[0].device
+    correct = torch.tensor([value is True for value in response_correct], dtype=torch.bool, device=device)
+    incorrect = torch.tensor([value is False for value in response_correct], dtype=torch.bool, device=device)
+
+    if loss_masks is None:
+        valid = torch.ones(len(advantages), dtype=torch.bool, device=device)
+    else:
+        valid = torch.tensor(
+            [mask.to(device=device).sum().item() > 0 for mask in loss_masks],
+            dtype=torch.bool,
+            device=device,
+        )
+
+    known = torch.tensor([_is_strict_bool(value) for value in response_correct], dtype=torch.bool, device=device)
+    valid_known = valid & known
+    return correct & valid_known, incorrect & valid_known, valid_known
+
+
+def _sample_advantage_means(advantages: list[torch.Tensor], loss_masks: list[torch.Tensor] | None) -> torch.Tensor:
+    means = []
+    for i, advantage in enumerate(advantages):
+        if loss_masks is None:
+            means.append(advantage.mean() if advantage.numel() > 0 else advantage.new_tensor(0.0))
+            continue
+        mask = loss_masks[i].to(device=advantage.device, dtype=advantage.dtype)
+        denom = mask.sum()
+        if denom.item() <= 0:
+            means.append(advantage.new_tensor(0.0))
+        else:
+            means.append((advantage * mask).sum() / denom)
+    return torch.stack(means)
+
+
+def _compute_local_margin_shift(
+    mean_advantages: torch.Tensor,
+    correct_mask: torch.Tensor,
+    incorrect_mask: torch.Tensor,
+    mode: str,
+    delta: float,
+) -> tuple[float, int, int]:
+    num_correct = int(correct_mask.sum().item())
+    num_incorrect = int(incorrect_mask.sum().item())
+    if num_correct == 0 or num_incorrect == 0:
+        return 0.0, num_correct, num_incorrect
+
+    correct_values = mean_advantages[correct_mask]
+    incorrect_values = mean_advantages[incorrect_mask]
+
+    if mode == "mean":
+        correct_stat = correct_values.mean()
+        incorrect_stat = incorrect_values.mean()
+    elif mode == "minmax":
+        correct_stat = correct_values.min()
+        incorrect_stat = incorrect_values.max()
+    else:
+        raise ValueError("--opd-margin-mode must be 'mean' or 'minmax'.")
+
+    gap = (correct_stat - incorrect_stat).item()
+    if gap >= delta:
+        return 0.0, num_correct, num_incorrect
+    return (incorrect_stat - correct_stat).item() + delta, num_correct, num_incorrect
+
+
+def _compute_global_margin_shift(
+    mean_advantages: torch.Tensor,
+    correct_mask: torch.Tensor,
+    incorrect_mask: torch.Tensor,
+    mode: str,
+    delta: float,
+) -> tuple[float, int, int]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return _compute_local_margin_shift(mean_advantages, correct_mask, incorrect_mask, mode, delta)
+
+    dp_group = mpu.get_data_parallel_group()
+    device = mean_advantages.device
+
+    if mode == "mean":
+        stats = torch.tensor(
+            [
+                mean_advantages[correct_mask].sum().item(),
+                float(correct_mask.sum().item()),
+                mean_advantages[incorrect_mask].sum().item(),
+                float(incorrect_mask.sum().item()),
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=dp_group)
+        correct_sum, num_correct, incorrect_sum, num_incorrect = stats.tolist()
+        if num_correct == 0 or num_incorrect == 0:
+            return 0.0, int(num_correct), int(num_incorrect)
+        correct_stat = correct_sum / num_correct
+        incorrect_stat = incorrect_sum / num_incorrect
+    elif mode == "minmax":
+        has_correct = correct_mask.any().item()
+        has_incorrect = incorrect_mask.any().item()
+        stats = torch.tensor(
+            [
+                mean_advantages[correct_mask].min().item() if has_correct else float("inf"),
+                -mean_advantages[incorrect_mask].max().item() if has_incorrect else float("inf"),
+                float(correct_mask.sum().item()),
+                float(incorrect_mask.sum().item()),
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        dist.all_reduce(stats[:2], op=dist.ReduceOp.MIN, group=dp_group)
+        dist.all_reduce(stats[2:], op=dist.ReduceOp.SUM, group=dp_group)
+        correct_stat = stats[0].item()
+        incorrect_stat = -stats[1].item()
+        num_correct = int(stats[2].item())
+        num_incorrect = int(stats[3].item())
+        if num_correct == 0 or num_incorrect == 0:
+            return 0.0, num_correct, num_incorrect
+    else:
+        raise ValueError("--opd-margin-mode must be 'mean' or 'minmax'.")
+
+    gap = correct_stat - incorrect_stat
+    if gap >= delta:
+        return 0.0, int(num_correct), int(num_incorrect)
+    return (incorrect_stat - correct_stat) + delta, int(num_correct), int(num_incorrect)
+
+
+def _apply_margin_shift(
+    advantages: list[torch.Tensor],
+    correct_mask: torch.Tensor,
+    incorrect_mask: torch.Tensor,
+    shift: float,
+    direction: str,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], int]:
+    shift_tensors = [torch.zeros_like(advantage) for advantage in advantages]
+    affected_tensors = [torch.zeros_like(advantage, dtype=torch.float32) for advantage in advantages]
+    if shift <= 0:
+        return shift_tensors, affected_tensors, 0
+
+    affected_samples = 0
+    for i, advantage in enumerate(advantages):
+        sample_shift = 0.0
+        if direction == "correct_up" and correct_mask[i]:
+            sample_shift = shift
+        elif direction == "incorrect_down" and incorrect_mask[i]:
+            sample_shift = -shift
+        elif direction == "both":
+            if correct_mask[i]:
+                sample_shift = shift / 2.0
+            elif incorrect_mask[i]:
+                sample_shift = -shift / 2.0
+        elif direction not in ["correct_up", "incorrect_down", "both"]:
+            raise ValueError("--opd-margin-direction must be 'correct_up', 'incorrect_down', or 'both'.")
+
+        if sample_shift == 0.0:
+            continue
+        sample_shift_tensor = torch.full_like(advantage, sample_shift)
+        advantages[i] = advantage + sample_shift_tensor
+        shift_tensors[i] = sample_shift_tensor
+        affected_tensors[i] = torch.ones_like(advantage, dtype=torch.float32)
+        affected_samples += 1
+    return shift_tensors, affected_tensors, affected_samples
+
+
+def apply_opd_margin_shift_to_advantages(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    advantages: list[torch.Tensor],
+    loss_masks: list[torch.Tensor] | None = None,
+) -> None:
+    if not getattr(args, "use_opd_margin_shift", False):
+        return
+
+    if not advantages:
+        return
+
+    scope = getattr(args, "opd_margin_scope", "local")
+    mode = getattr(args, "opd_margin_mode", "mean")
+    delta = getattr(args, "opd_margin_delta", 0.0)
+    direction = getattr(args, "opd_margin_direction", "correct_up")
+    if delta < 0:
+        raise ValueError("--opd-margin-delta must be non-negative.")
+
+    if loss_masks is not None and len(loss_masks) != len(advantages):
+        raise ValueError("loss_masks length must match advantages length for OPD margin shift.")
+
+    mean_advantages = _sample_advantage_means(advantages, loss_masks)
+    correct_mask, incorrect_mask, valid_known_mask = _get_response_correct_mask(rollout_data, advantages, loss_masks)
+
+    all_shift_tensors = [torch.zeros_like(advantage) for advantage in advantages]
+    all_affected_tensors = [torch.zeros_like(advantage, dtype=torch.float32) for advantage in advantages]
+    affected_samples = 0
+    num_correct = int(correct_mask.sum().item())
+    num_incorrect = int(incorrect_mask.sum().item())
+
+    if scope == "local":
+        shift, num_correct, num_incorrect = _compute_local_margin_shift(
+            mean_advantages, correct_mask, incorrect_mask, mode, delta
+        )
+        all_shift_tensors, all_affected_tensors, affected_samples = _apply_margin_shift(
+            advantages, correct_mask, incorrect_mask, shift, direction
+        )
+    elif scope == "global":
+        shift, num_correct, num_incorrect = _compute_global_margin_shift(
+            mean_advantages, correct_mask, incorrect_mask, mode, delta
+        )
+        all_shift_tensors, all_affected_tensors, affected_samples = _apply_margin_shift(
+            advantages, correct_mask, incorrect_mask, shift, direction
+        )
+    elif scope == "group":
+        sample_group_index = rollout_data.get("sample_group_index")
+        if sample_group_index is None:
+            logger.warning("OPD margin shift scope='group' requires sample_group_index; skipping.")
+        else:
+            if len(sample_group_index) != len(advantages):
+                raise ValueError("sample_group_index length must match advantages length for OPD margin shift.")
+            group_ids = sorted(group_id for group_id in set(sample_group_index) if group_id is not None)
+            for group_id in group_ids:
+                group_mask = torch.tensor(
+                    [sample_group == group_id for sample_group in sample_group_index],
+                    dtype=torch.bool,
+                    device=mean_advantages.device,
+                )
+                group_correct = correct_mask & group_mask
+                group_incorrect = incorrect_mask & group_mask
+                shift, _, _ = _compute_local_margin_shift(
+                    mean_advantages, group_correct, group_incorrect, mode, delta
+                )
+                shift_tensors, affected_tensors, group_affected = _apply_margin_shift(
+                    advantages, group_correct, group_incorrect, shift, direction
+                )
+                all_shift_tensors = [
+                    current + update for current, update in zip(all_shift_tensors, shift_tensors, strict=False)
+                ]
+                all_affected_tensors = [
+                    torch.maximum(current, update)
+                    for current, update in zip(all_affected_tensors, affected_tensors, strict=False)
+                ]
+                affected_samples += group_affected
+    else:
+        raise ValueError("--opd-margin-scope must be 'local', 'global', or 'group'.")
+
+    rollout_data["opd_margin_shift"] = all_shift_tensors
+    rollout_data["opd_margin_affected"] = all_affected_tensors
+    device = advantages[0].device
+    rollout_data["opd_margin_affected_samples"] = torch.tensor(float(affected_samples), dtype=torch.float32, device=device)
+    rollout_data["opd_margin_known_samples"] = torch.tensor(
+        float(valid_known_mask.sum().item()),
+        dtype=torch.float32,
+        device=device,
+    )
+    rollout_data["opd_margin_correct_samples"] = torch.tensor(float(num_correct), dtype=torch.float32, device=device)
+    rollout_data["opd_margin_incorrect_samples"] = torch.tensor(float(num_incorrect), dtype=torch.float32, device=device)
 
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
@@ -686,6 +971,13 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             advantages=advantages,
             student_log_probs=log_probs,
         )
+
+    apply_opd_margin_shift_to_advantages(
+        args=args,
+        rollout_data=rollout_data,
+        advantages=advantages,
+        loss_masks=loss_masks,
+    )
 
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
     if args.normalize_advantages:
@@ -1024,6 +1316,14 @@ def policy_loss_function(
     if "opd_reverse_kl" in batch:
         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+
+    if "opd_margin_shift" in batch and batch["opd_margin_shift"]:
+        opd_margin_shift = torch.cat(batch["opd_margin_shift"], dim=0)
+        reported_loss["opd_margin_shift"] = sum_of_sample_mean(opd_margin_shift).clone().detach()
+
+    if "opd_margin_affected" in batch and batch["opd_margin_affected"]:
+        opd_margin_affected = torch.cat(batch["opd_margin_affected"], dim=0)
+        reported_loss["opd_margin_affected"] = sum_of_sample_mean(opd_margin_affected).clone().detach()
 
     return loss, reported_loss
 

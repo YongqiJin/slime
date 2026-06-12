@@ -752,6 +752,12 @@ class RolloutManager:
                 for sample in samples
             ]
 
+        if any(_get_response_correct(sample) is not None for sample in samples):
+            train_data["response_correct"] = [_get_response_correct(sample) for sample in samples]
+
+        if any(sample.group_index is not None for sample in samples):
+            train_data["sample_group_index"] = [sample.group_index for sample in samples]
+
         # For rollout buffer
         if samples[0].metadata and "round_number" in samples[0].metadata:
             train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
@@ -819,6 +825,8 @@ class RolloutManager:
                 "rollout_mask_sums",
                 "rollout_log_probs",
                 "rollout_routed_experts",
+                "response_correct",
+                "sample_group_index",
                 "prompt",
                 "teacher_log_probs",
             ]:
@@ -1252,6 +1260,8 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_response_correct_metrics(samples)
+    log_dict |= _compute_opd_teacher_metrics(samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
@@ -1348,6 +1358,13 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     if args.advantage_estimator == "ppo":
         return {}
 
+    def _is_numeric_reward(reward):
+        return isinstance(reward, (int, float)) and not isinstance(reward, bool) and np.isfinite(reward)
+
+    sample_rewards = [sample.get_reward_value(args) for sample in all_samples]
+    if any(not _is_numeric_reward(reward) for reward in sample_rewards):
+        return {}
+
     def _is_zero_std(samples: list[Sample]):
         rewards = [sample.get_reward_value(args) for sample in samples]
         return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
@@ -1389,3 +1406,40 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
+
+def _get_response_correct(sample: Sample) -> bool | None:
+    value = sample.metadata.get("response_correct") if isinstance(sample.metadata, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def _compute_response_correct_metrics(all_samples: list[Sample]):
+    response_correct = [_get_response_correct(sample) for sample in all_samples]
+    known = [value for value in response_correct if value is not None]
+    if not known:
+        return {}
+    return {
+        "response_correct/known_ratio": len(known) / len(all_samples),
+        "response_correct/accuracy": sum(1 for value in known if value) / len(known),
+    }
+
+
+def _get_opd_teacher_name(sample: Sample) -> str | None:
+    value = sample.metadata.get("opd_teacher_name") if isinstance(sample.metadata, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _sanitize_metric_component(value: str) -> str:
+    return "".join(char if char.isalnum() or char in "._-" else "_" for char in value)
+
+
+def _compute_opd_teacher_metrics(all_samples: list[Sample]):
+    teacher_names = [_get_opd_teacher_name(sample) for sample in all_samples]
+    known = [name for name in teacher_names if name is not None]
+    if not known:
+        return {}
+
+    metrics = {"opd_teacher/known_ratio": len(known) / len(all_samples)}
+    for teacher_name, items in group_by(known).items():
+        metrics[f"opd_teacher/name_{_sanitize_metric_component(teacher_name)}"] = len(items) / len(known)
+    return metrics

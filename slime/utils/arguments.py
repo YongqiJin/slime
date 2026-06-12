@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 import warnings
 from typing import Any
@@ -1108,6 +1109,67 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--opd-teacher-config",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a script-generated OPD SGLang teacher runtime config. "
+                    "When set, slime selects teacher URLs from this config instead of --rm-url."
+                ),
+            )
+            parser.add_argument(
+                "--opd-correctness-balance-mode",
+                type=str,
+                choices=["global", "per_group"],
+                default="global",
+                help=(
+                    "Balance mode for slime.rollout.filter_hub.correctness_balance.rollout_sample_filter. "
+                    "'global' balances across the rollout batch; 'per_group' balances inside each prompt group."
+                ),
+            )
+            parser.add_argument(
+                "--opd-correctness-balance-ratio",
+                type=float,
+                default=1.0,
+                help=(
+                    "Correct:incorrect target ratio for OPD correctness balance. "
+                    "Use 1.0 for 1:1, 0.0 for incorrect-only, and inf for correct-only."
+                ),
+            )
+            parser.add_argument(
+                "--use-opd-margin-shift",
+                action="store_true",
+                default=False,
+                help="Enable OPD correctness margin shift after OPD KL advantage construction.",
+            )
+            parser.add_argument(
+                "--opd-margin-scope",
+                type=str,
+                choices=["local", "global", "group"],
+                default="local",
+                help="Scope for OPD correctness margin shift.",
+            )
+            parser.add_argument(
+                "--opd-margin-mode",
+                type=str,
+                choices=["mean", "minmax"],
+                default="mean",
+                help="Statistic used to compute OPD correctness margin shift.",
+            )
+            parser.add_argument(
+                "--opd-margin-delta",
+                type=float,
+                default=0.0,
+                help="Required gap where correct_stat - incorrect_stat >= delta.",
+            )
+            parser.add_argument(
+                "--opd-margin-direction",
+                type=str,
+                choices=["correct_up", "incorrect_down", "both"],
+                default="correct_up",
+                help="How to apply the OPD correctness margin shift.",
+            )
             return parser
 
         def add_router_arguments(parser):
@@ -1742,32 +1804,21 @@ def _validate_update_weight_args(args) -> None:
             )
 
 
-def slime_validate_args(args):
-    args.eval_datasets = _resolve_eval_datasets(args)
+def _validate_opd_args(args) -> None:
+    balance_ratio = getattr(args, "opd_correctness_balance_ratio", 1.0)
+    if math.isnan(balance_ratio) or balance_ratio < 0:
+        raise ValueError("--opd-correctness-balance-ratio must be non-negative and not NaN.")
+    margin_delta = getattr(args, "opd_margin_delta", 0.0)
+    if not math.isfinite(margin_delta) or margin_delta < 0:
+        raise ValueError("--opd-margin-delta must be finite and non-negative.")
 
-    if args.use_slime_router:
-        logger.warning(
-            "--use-slime-router is deprecated and ignored. slime now always uses sglang_router "
-            "built from https://github.com/zhuzilin/sgl-router."
-        )
-        args.use_slime_router = False
-
-    if args.kl_coef != 0 or args.use_kl_loss:
-        if not os.path.exists(args.ref_load):
-            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
-
-        if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
-            logger.info(
-                f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
-                "please make sure it is a valid megatron checkpoint directory."
-            )
-
-    # Validate on-policy distillation (OPD) arguments
     if args.use_opd:
         if args.opd_type is None:
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
 
         if args.opd_type == "megatron":
+            if args.opd_teacher_config is not None:
+                raise ValueError("--opd-teacher-config is only supported when --opd-type=sglang.")
             if args.opd_teacher_load is None:
                 raise ValueError(
                     "--opd-teacher-load is required when --opd-type=megatron. "
@@ -1789,10 +1840,41 @@ def slime_validate_args(args):
                     "--opd-teacher-load should not be set when --opd-type=sglang. "
                     "In sglang mode, teacher log-probs are obtained from external server during rollout."
                 )
+            if args.opd_teacher_config is None and args.rm_url is None:
+                raise ValueError("--opd-type=sglang requires either --opd-teacher-config or --rm-url.")
+            if args.opd_teacher_config is not None and not os.path.exists(args.opd_teacher_config):
+                raise FileNotFoundError(
+                    f"opd_teacher_config {args.opd_teacher_config} does not exist, please check the path."
+                )
     else:
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
+        if args.opd_teacher_config is not None:
+            raise ValueError("--opd-teacher-config is set but --use-opd is not enabled. Please add --use-opd flag.")
+
+
+def slime_validate_args(args):
+    args.eval_datasets = _resolve_eval_datasets(args)
+
+    if args.use_slime_router:
+        logger.warning(
+            "--use-slime-router is deprecated and ignored. slime now always uses sglang_router "
+            "built from https://github.com/zhuzilin/sgl-router."
+        )
+        args.use_slime_router = False
+
+    if args.kl_coef != 0 or args.use_kl_loss:
+        if not os.path.exists(args.ref_load):
+            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+
+        if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
+            logger.info(
+                f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
+                "please make sure it is a valid megatron checkpoint directory."
+            )
+
+    _validate_opd_args(args)
 
     if args.megatron_to_hf_mode == "bridge":
         if (
