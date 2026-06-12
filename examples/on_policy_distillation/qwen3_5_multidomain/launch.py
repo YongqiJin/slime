@@ -103,10 +103,7 @@ def _optional_wandb_args(env: dict[str, str], mode: str) -> list[str]:
     if env.get("WANDB_MODE"):
         args += ["--wandb-mode", env["WANDB_MODE"]]
 
-    wandb_key = env.get("WANDB_KEY") or env.get("WANDB_API_KEY")
-    if wandb_key:
-        args += ["--wandb-key", wandb_key]
-    elif not env.get("WANDB_MODE"):
+    if not (env.get("WANDB_KEY") or env.get("WANDB_API_KEY") or env.get("WANDB_MODE")):
         args += ["--wandb-mode", "offline"]
 
     if _is_enabled(env, "DISABLE_WANDB_RANDOM_SUFFIX", default=False):
@@ -159,16 +156,40 @@ def _model_args(root: Path, model_size: str) -> list[str]:
 
 
 def _runtime_env_json(env: dict[str, str]) -> str:
+    env_vars = {
+        "PYTHONPATH": _env(env, "MEGATRON_PATH", "/root/Megatron-LM/"),
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "MASTER_ADDR": _require_env(env, "MASTER_ADDR"),
+    }
+    for name in [
+        "WANDB_API_KEY",
+        "WANDB_BASE_URL",
+        "WANDB_ENTITY",
+        "WANDB_MODE",
+    ]:
+        if env.get(name):
+            env_vars[name] = env[name]
+    if env.get("WANDB_KEY") and not env.get("WANDB_API_KEY"):
+        env_vars["WANDB_API_KEY"] = env["WANDB_KEY"]
+
     return json.dumps(
-        {
-            "env_vars": {
-                "PYTHONPATH": _env(env, "MEGATRON_PATH", "/root/Megatron-LM/"),
-                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-                "MASTER_ADDR": _require_env(env, "MASTER_ADDR"),
-            }
-        },
+        {"env_vars": env_vars},
         separators=(",", ":"),
     )
+
+
+def _redact_command(command: list[str]) -> list[str]:
+    redacted = []
+    redact_next = False
+    for item in command:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        redacted.append(item)
+        if item in {"--wandb-key"}:
+            redact_next = True
+    return redacted
 
 
 def _smoke_log_path(root: Path, env: dict[str, str]) -> Path:
@@ -194,7 +215,8 @@ def _smoke_log_path(root: Path, env: dict[str, str]) -> Path:
 
 
 def _run(command: list[str], dry_run: bool, log_path: Path | None = None) -> None:
-    print("+", shlex.join(command))
+    display_command = _redact_command(command)
+    print("+", shlex.join(display_command))
     if dry_run:
         if log_path is not None:
             print(f"Would log command output to {log_path}")
@@ -206,7 +228,7 @@ def _run(command: list[str], dry_run: bool, log_path: Path | None = None) -> Non
 
     print(f"Logging command output to {log_path}")
     with log_path.open("a", encoding="utf-8") as log_file:
-        log_file.write("+ " + shlex.join(command) + "\n")
+        log_file.write("+ " + shlex.join(display_command) + "\n")
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         assert process.stdout is not None
         for line in process.stdout:

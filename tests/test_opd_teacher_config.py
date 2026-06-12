@@ -24,6 +24,7 @@ from slime.rollout.on_policy_distillation import (
 )
 from slime.ray.rollout import compute_metrics_from_samples
 from slime.utils.types import Sample
+from slime.utils.wandb_utils import _args_to_config_dict
 
 
 NUM_GPUS = 0
@@ -681,13 +682,40 @@ def test_qwen35_smoke_wandb_can_use_online_credentials_or_be_disabled():
         },
     )
 
-    assert online_cmd[online_cmd.index("--wandb-key") + 1] == "secret"
+    runtime_env = json.loads(
+        launch._runtime_env_json(
+            {
+                "MASTER_ADDR": "10.0.0.1",
+                "WANDB_KEY": "secret",
+            }
+        )
+    )
+
+    assert runtime_env["env_vars"]["WANDB_API_KEY"] == "secret"
+    assert "--wandb-key" not in online_cmd
     assert online_cmd[online_cmd.index("--wandb-project") + 1] == "opd"
     assert online_cmd[online_cmd.index("--wandb-group") + 1] == "smoke-2node"
     assert online_cmd[online_cmd.index("--wandb-team") + 1] == "team"
     assert online_cmd[online_cmd.index("--wandb-mode") + 1] == "online"
     assert "--disable-wandb-random-suffix" in online_cmd
     assert "--use-wandb" not in disabled_cmd
+
+
+@pytest.mark.unit
+def test_qwen35_launcher_redacts_wandb_key_from_logged_command():
+    launch = _load_qwen35_launch_module()
+
+    redacted = launch._redact_command(["python3", "train.py", "--wandb-key", "secret", "--use-wandb"])
+
+    assert redacted == ["python3", "train.py", "--wandb-key", "<redacted>", "--use-wandb"]
+
+
+@pytest.mark.unit
+def test_wandb_config_redacts_wandb_key():
+    config = _args_to_config_dict(types.SimpleNamespace(wandb_key="secret", wandb_project="opd"))
+
+    assert config["wandb_key"] == "<redacted>"
+    assert config["wandb_project"] == "opd"
 
 
 @pytest.mark.unit

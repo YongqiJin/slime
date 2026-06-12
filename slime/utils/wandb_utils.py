@@ -96,7 +96,10 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    config = deepcopy(args.__dict__)
+    if "wandb_key" in config and config["wandb_key"] is not None:
+        config["wandb_key"] = "<redacted>"
+    return config
 
 
 def _prefix_config_keys(config, prefix):
