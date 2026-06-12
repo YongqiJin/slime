@@ -623,6 +623,11 @@ def test_qwen35_launcher_builds_production_and_smoke_commands(tmp_path):
 
     assert "--ci-test" not in production_cmd
     assert "--ci-test" in smoke_cmd
+    assert "--use-wandb" not in production_cmd
+    assert "--use-wandb" in smoke_cmd
+    assert smoke_cmd[smoke_cmd.index("--wandb-project") + 1] == "slime-opd-smoke"
+    assert smoke_cmd[smoke_cmd.index("--wandb-group") + 1] == "qwen3_5_multidomain-smoke"
+    assert smoke_cmd[smoke_cmd.index("--wandb-mode") + 1] == "offline"
     assert "--ci-disable-kl-checker" not in production_cmd
     assert "--ci-disable-kl-checker" in smoke_cmd
     assert "--no-load-optim" not in production_cmd
@@ -642,6 +647,66 @@ def test_qwen35_launcher_builds_production_and_smoke_commands(tmp_path):
     assert all("____" not in arg for arg in production_cmd + smoke_cmd)
     assert "http://teacher/generate" in production_cmd
     assert "http://teacher/generate" in smoke_cmd
+
+
+@pytest.mark.unit
+def test_qwen35_smoke_wandb_can_use_online_credentials_or_be_disabled():
+    launch = _load_qwen35_launch_module()
+    base_env = {
+        "BASE_FOLDER": "/models",
+        "MASTER_ADDR": "10.0.0.1",
+        "TEACHER_RM_URL": "http://teacher/generate",
+        "SMOKE_DATA_FILE": "/data/smoke.parquet",
+    }
+
+    online_cmd = launch._build_train_cmd(
+        REPO_ROOT,
+        "smoke",
+        {
+            **base_env,
+            "WANDB_KEY": "secret",
+            "WANDB_PROJECT": "opd",
+            "WANDB_GROUP": "smoke-2node",
+            "WANDB_TEAM": "team",
+            "WANDB_MODE": "online",
+            "DISABLE_WANDB_RANDOM_SUFFIX": "1",
+        },
+    )
+    disabled_cmd = launch._build_train_cmd(
+        REPO_ROOT,
+        "smoke",
+        {
+            **base_env,
+            "ENABLE_WANDB": "0",
+        },
+    )
+
+    assert online_cmd[online_cmd.index("--wandb-key") + 1] == "secret"
+    assert online_cmd[online_cmd.index("--wandb-project") + 1] == "opd"
+    assert online_cmd[online_cmd.index("--wandb-group") + 1] == "smoke-2node"
+    assert online_cmd[online_cmd.index("--wandb-team") + 1] == "team"
+    assert online_cmd[online_cmd.index("--wandb-mode") + 1] == "online"
+    assert "--disable-wandb-random-suffix" in online_cmd
+    assert "--use-wandb" not in disabled_cmd
+
+
+@pytest.mark.unit
+def test_qwen35_smoke_log_path_uses_run_directory_and_latest_symlink(tmp_path):
+    launch = _load_qwen35_launch_module()
+
+    log_path = launch._smoke_log_path(
+        REPO_ROOT,
+        {
+            "OPD_SMOKE_LOG_DIR": str(tmp_path / "runs"),
+            "OPD_SMOKE_RUN_ID": "run-1",
+        },
+    )
+
+    assert log_path == tmp_path / "runs" / "run-1" / "smoke.log"
+    assert log_path.parent.is_dir()
+    latest = tmp_path / "runs" / "latest"
+    assert latest.is_symlink()
+    assert latest.resolve() == log_path.parent
 
 
 @pytest.mark.unit
@@ -695,6 +760,8 @@ def test_qwen35_shell_entrypoints_support_dry_run(tmp_path):
         "MASTER_ADDR": "10.0.0.1",
         "HOSTFILE": str(hostfile),
         "TEACHER_RM_URL": "http://teacher/generate",
+        "OPD_SMOKE_LOG_DIR": str(tmp_path / "runs"),
+        "OPD_SMOKE_RUN_ID": "dry-run",
     }
 
     production = subprocess.run(
@@ -718,6 +785,8 @@ def test_qwen35_shell_entrypoints_support_dry_run(tmp_path):
     assert "Qwen3.5-9B" in smoke.stdout
     assert "--ci-test" in smoke.stdout
     assert "--ci-disable-kl-checker" in smoke.stdout
+    assert "--use-wandb" in smoke.stdout
+    assert "Would log command output to" in smoke.stdout
 
 
 @pytest.mark.unit

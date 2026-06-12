@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -73,6 +74,48 @@ def _optional_rollout_args(env: dict[str, str]) -> list[str]:
     return args
 
 
+def _is_enabled(env: dict[str, str], name: str, default: bool) -> bool:
+    value = env.get(name)
+    if value is None:
+        return default
+    return value.lower() not in {"0", "false", "no", "off"}
+
+
+def _optional_wandb_args(env: dict[str, str], mode: str) -> list[str]:
+    if not _is_enabled(env, "ENABLE_WANDB", default=mode == "smoke"):
+        return []
+
+    args = [
+        "--use-wandb",
+        "--wandb-project",
+        _env(env, "WANDB_PROJECT", "slime-opd-smoke" if mode == "smoke" else "slime-opd"),
+        "--wandb-group",
+        _env(env, "WANDB_GROUP", f"qwen3_5_multidomain-{mode}"),
+    ]
+    if env.get("WANDB_TEAM"):
+        args += ["--wandb-team", env["WANDB_TEAM"]]
+    if env.get("WANDB_HOST"):
+        args += ["--wandb-host", env["WANDB_HOST"]]
+    if env.get("WANDB_DIR"):
+        args += ["--wandb-dir", env["WANDB_DIR"]]
+    if env.get("WANDB_RUN_ID"):
+        args += ["--wandb-run-id", env["WANDB_RUN_ID"]]
+    if env.get("WANDB_MODE"):
+        args += ["--wandb-mode", env["WANDB_MODE"]]
+
+    wandb_key = env.get("WANDB_KEY") or env.get("WANDB_API_KEY")
+    if wandb_key:
+        args += ["--wandb-key", wandb_key]
+    elif not env.get("WANDB_MODE"):
+        args += ["--wandb-mode", "offline"]
+
+    if _is_enabled(env, "DISABLE_WANDB_RANDOM_SUFFIX", default=False):
+        args += ["--disable-wandb-random-suffix"]
+    if _is_enabled(env, "WANDB_ALWAYS_USE_TRAIN_STEP", default=False):
+        args += ["--wandb-always-use-train-step"]
+    return args
+
+
 def _smoke_num_rollout(env: dict[str, str]) -> str:
     value = _env(env, "NUM_ROLLOUT", "4")
     try:
@@ -128,10 +171,49 @@ def _runtime_env_json(env: dict[str, str]) -> str:
     )
 
 
-def _run(command: list[str], dry_run: bool) -> None:
+def _smoke_log_path(root: Path, env: dict[str, str]) -> Path:
+    default_log_root = root / "examples" / "on_policy_distillation" / "qwen3_5_multidomain" / "runs"
+    log_root = Path(_env(env, "OPD_SMOKE_LOG_DIR", str(default_log_root)))
+    run_id = env.get("OPD_SMOKE_RUN_ID")
+    if not run_id:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        job = env.get("DLC_JOB_ID") or "local"
+        pod = env.get("POD_NAME") or "master"
+        run_id = f"{timestamp}-{job}-{pod}"
+
+    log_dir = log_root / run_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+    latest = log_root / "latest"
+    try:
+        if latest.exists() or latest.is_symlink():
+            latest.unlink()
+        latest.symlink_to(log_dir, target_is_directory=True)
+    except OSError:
+        pass
+    return log_dir / "smoke.log"
+
+
+def _run(command: list[str], dry_run: bool, log_path: Path | None = None) -> None:
     print("+", shlex.join(command))
-    if not dry_run:
+    if dry_run:
+        if log_path is not None:
+            print(f"Would log command output to {log_path}")
+        return
+
+    if log_path is None:
         subprocess.run(command, check=True)
+        return
+
+    print(f"Logging command output to {log_path}")
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write("+ " + shlex.join(command) + "\n")
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            log_file.write(line)
+        if process.wait() != 0:
+            raise subprocess.CalledProcessError(process.returncode, process.args)
 
 
 def _start_ray(root: Path, env: dict[str, str], require_hostfile: bool, dry_run: bool) -> None:
@@ -335,6 +417,7 @@ def _build_train_cmd(root: Path, mode: str, env: dict[str, str]) -> list[str]:
         *launcher_args,
         *_optional_rollout_args(env),
         *_runtime_teacher_args(env),
+        *_optional_wandb_args(env, mode),
         "--advantage-estimator",
         "grpo",
         "--use-opd",
@@ -382,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
     _start_ray(root, env, require_hostfile=require_hostfile, dry_run=args.dry_run)
     _wait_for_ray_nodes(env, dry_run=args.dry_run)
     train_cmd = _build_train_cmd(root, args.mode, env)
+    log_path = _smoke_log_path(root, env) if args.mode == "smoke" else None
     _run(
         [
             "ray",
@@ -393,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
             *train_cmd,
         ],
         args.dry_run,
+        log_path=log_path,
     )
     return 0
 
